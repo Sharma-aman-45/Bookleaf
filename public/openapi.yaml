@@ -1,0 +1,585 @@
+openapi: 3.0.3
+info:
+  title: BookLeaf Author Support API
+  version: 1.0.0
+  description: |
+    REST API for the BookLeaf Author Support & Communication Portal.
+
+    Authentication: call `POST /auth/login`. The response sets a session cookie (used by the web app)
+    and returns an `access_token` you can send as `Authorization: Bearer <token>` from Postman or curl.
+
+    Roles: `author` users only ever see their own books and tickets. `admin` users see everything.
+
+    Every success response is wrapped as `{ "data": ... }`. Every error response is
+    `{ "error": { "code", "message", "details" } }`.
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+tags:
+  - name: Auth
+  - name: Books
+  - name: Tickets
+  - name: Messages
+  - name: Admin
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in with email and password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: admin@bookleaf.in }
+                password: { type: string, example: Admin@123 }
+      responses:
+        "200":
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      user: { $ref: "#/components/schemas/SessionUser" }
+                      access_token: { type: string }
+                      expires_at: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Sign out and clear the session cookie
+      responses:
+        "200": { description: Signed out }
+  /me:
+    get:
+      tags: [Auth]
+      summary: Current user profile
+      responses:
+        "200":
+          description: Profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/SessionUser" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+  /books:
+    get:
+      tags: [Books]
+      summary: List books with a royalty summary
+      description: Authors get their own books. Admins get all books, optionally filtered by author.
+      parameters:
+        - in: query
+          name: author_id
+          schema: { type: string }
+          description: Admin only
+      responses:
+        "200":
+          description: Books and totals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Book" }
+                      summary: { $ref: "#/components/schemas/RoyaltySummary" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+  /books/{id}:
+    get:
+      tags: [Books]
+      summary: Get one book
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Book
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Book" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /tickets:
+    get:
+      tags: [Tickets]
+      summary: List tickets
+      description: Authors get their own tickets. Admins get the full queue with filters.
+      parameters:
+        - { in: query, name: status, schema: { type: string }, description: "Comma separated: open,in_progress,resolved,closed" }
+        - { in: query, name: category, schema: { type: string }, description: "Comma separated category keys" }
+        - { in: query, name: priority, schema: { type: string }, description: "Comma separated: critical,high,medium,low" }
+        - { in: query, name: assigned, schema: { type: string, enum: [any, me, unassigned], default: any } }
+        - { in: query, name: from, schema: { type: string, format: date } }
+        - { in: query, name: to, schema: { type: string, format: date } }
+        - { in: query, name: q, schema: { type: string }, description: "Searches subject and description, or a ticket number like BL-1001" }
+        - { in: query, name: author_id, schema: { type: string }, description: Admin only }
+        - { in: query, name: sort, schema: { type: string, enum: [urgency, oldest, newest, activity], default: urgency } }
+        - { in: query, name: limit, schema: { type: integer, default: 50, maximum: 100 } }
+        - { in: query, name: offset, schema: { type: integer, default: 0 } }
+      responses:
+        "200":
+          description: Paginated tickets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/TicketListItem" }
+                      total: { type: integer }
+                      limit: { type: integer }
+                      offset: { type: integer }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    post:
+      tags: [Tickets]
+      summary: Raise a ticket (author only)
+      description: |
+        The ticket is saved first and returned immediately. AI classification (category and priority)
+        runs after the response is sent. If the AI is unavailable, keyword rules classify the ticket instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, description]
+              properties:
+                book_id: { type: string, nullable: true, description: "Null for General / Account Level" }
+                subject: { type: string, minLength: 5, maxLength: 150 }
+                description: { type: string, minLength: 20, maxLength: 5000 }
+                attachment: { $ref: "#/components/schemas/Attachment" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Ticket" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /tickets/{id}:
+    get:
+      tags: [Tickets]
+      summary: Ticket with messages
+      description: Admins also receive internal notes, the activity log and AI reasoning. Authors never do.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Ticket detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/TicketDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Tickets]
+      summary: Update status, override category or priority, or assign (admin only)
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                status: { $ref: "#/components/schemas/Status" }
+                category: { $ref: "#/components/schemas/Category" }
+                priority: { $ref: "#/components/schemas/Priority" }
+                assigned_to:
+                  nullable: true
+                  type: string
+                  description: '"me", an admin profile UUID, or null to unassign'
+      responses:
+        "200":
+          description: Updated ticket
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/TicketDetail" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /tickets/{id}/messages:
+    get:
+      tags: [Messages]
+      summary: Messages visible to the author
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Message" }
+    post:
+      tags: [Messages]
+      summary: Reply on a ticket
+      description: |
+        Admin replies are shown to the author in real time. An admin's first reply sets `first_response_at`,
+        moves an open ticket to in progress and assigns it to them if unassigned.
+        An author reply on a resolved ticket reopens it. Authors cannot reply on closed tickets (409).
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, minLength: 2, maxLength: 5000 }
+                ai_assisted: { type: boolean, description: "Admin only. True when the reply started from an AI draft." }
+                status: { $ref: "#/components/schemas/Status" }
+      responses:
+        "201":
+          description: Sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Message" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /tickets/{id}/notes:
+    get:
+      tags: [Admin]
+      summary: Internal notes (admin only)
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200": { description: Notes }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Admin]
+      summary: Add an internal note (admin only)
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, minLength: 2, maxLength: 3000 }
+      responses:
+        "201": { description: Note saved }
+  /tickets/{id}/assign:
+    post:
+      tags: [Admin]
+      summary: Assign the ticket to yourself
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200": { description: Assigned }
+    delete:
+      tags: [Admin]
+      summary: Unassign the ticket
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200": { description: Unassigned }
+  /tickets/{id}/draft:
+    get:
+      tags: [Admin]
+      summary: Get the AI draft reply
+      description: |
+        Returns a cached AI draft when the ticket context (category, last message) has not changed,
+        otherwise generates one. When the AI is unavailable, returns a policy template with
+        `source: template` and a `notice`, so the admin can still reply.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Draft
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Draft" }
+    post:
+      tags: [Admin]
+      summary: Regenerate the draft, optionally with an instruction
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                guidance: { type: string, maxLength: 300, example: "Shorter, and mention the payout date" }
+      responses:
+        "200":
+          description: Draft
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Draft" }
+  /tickets/{id}/classify:
+    post:
+      tags: [Admin]
+      summary: Run AI classification again
+      description: Admin overrides are preserved. Only fields still set by AI or rules are replaced.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200": { description: Reclassified ticket }
+  /uploads:
+    post:
+      tags: [Tickets]
+      summary: Upload an attachment before raising a ticket (author only)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        "201":
+          description: Stored. Pass the returned object as `attachment` when creating the ticket.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Attachment" }
+        "413": { description: File larger than 5 MB }
+        "415": { description: File type not allowed }
+  /admin/stats:
+    get:
+      tags: [Admin]
+      summary: Queue counters
+      responses:
+        "200": { description: "Open, in progress, critical, unassigned and late-first-reply counts" }
+  /admin/ai-insights:
+    get:
+      tags: [Admin]
+      summary: AI usage, cost and override metrics for the last 30 days
+      responses:
+        "200": { description: Insights }
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: List admin users (for assignment)
+      responses:
+        "200": { description: Admins }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sb-access-token
+  parameters:
+    Id:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+  responses:
+    Unauthenticated:
+      description: Missing or invalid session
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Role not allowed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found, or not owned by this author
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: Action not allowed in the current state
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Invalid input, with a message per field
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string, example: Some fields are missing or invalid. }
+            details:
+              nullable: true
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string, example: subject }
+                  message: { type: string, example: Subject must be at least 5 characters. }
+    Status:
+      type: string
+      enum: [open, in_progress, resolved, closed]
+    Priority:
+      type: string
+      enum: [critical, high, medium, low]
+    Category:
+      type: string
+      enum: [royalty_payments, isbn_metadata, printing_quality, distribution_availability, book_status_production, general_inquiry]
+    Source:
+      type: string
+      enum: [pending, ai, fallback, admin]
+    SessionUser:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        role: { type: string, enum: [author, admin] }
+        fullName: { type: string }
+        authorId: { type: string, nullable: true }
+    Book:
+      type: object
+      properties:
+        id: { type: string }
+        author_id: { type: string }
+        title: { type: string }
+        isbn: { type: string, nullable: true }
+        genre: { type: string, nullable: true }
+        publication_date: { type: string, format: date, nullable: true }
+        status: { type: string }
+        mrp: { type: number }
+        total_copies_sold: { type: integer }
+        total_royalty_earned: { type: number }
+        royalty_paid: { type: number }
+        royalty_pending: { type: number }
+        last_payout_date: { type: string, format: date, nullable: true }
+        platforms: { type: array, items: { type: string } }
+    RoyaltySummary:
+      type: object
+      properties:
+        books: { type: integer }
+        published: { type: integer }
+        copies: { type: integer }
+        earned: { type: number }
+        paid: { type: number }
+        pending: { type: number }
+        threshold: { type: number, example: 1000 }
+        eligibility: { type: string, enum: [nothing_pending, below_threshold, eligible] }
+        quarter_end: { type: string, format: date }
+        next_payout_by: { type: string, format: date }
+    Attachment:
+      type: object
+      nullable: true
+      properties:
+        path: { type: string }
+        name: { type: string }
+        size: { type: integer }
+        type: { type: string, enum: [image/png, image/jpeg, image/webp, application/pdf] }
+        url: { type: string, nullable: true, description: Signed URL valid for one hour (read only) }
+    Ticket:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ticket_number: { type: integer, example: 1001 }
+        author_id: { type: string }
+        book_id: { type: string, nullable: true }
+        subject: { type: string }
+        description: { type: string }
+        status: { $ref: "#/components/schemas/Status" }
+        category: { allOf: [{ $ref: "#/components/schemas/Category" }], nullable: true }
+        category_source: { $ref: "#/components/schemas/Source" }
+        priority: { $ref: "#/components/schemas/Priority" }
+        priority_source: { $ref: "#/components/schemas/Source" }
+        ai_confidence: { type: number, nullable: true }
+        ai_reasoning: { type: string, nullable: true }
+        assigned_to: { type: string, nullable: true }
+        attachment: { $ref: "#/components/schemas/Attachment" }
+        last_reply_by: { type: string, enum: [author, admin], nullable: true }
+        last_activity_at: { type: string, format: date-time }
+        first_response_at: { type: string, format: date-time, nullable: true }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    TicketListItem:
+      allOf:
+        - $ref: "#/components/schemas/Ticket"
+        - type: object
+          properties:
+            author: { type: object, properties: { id: { type: string }, name: { type: string }, email: { type: string } } }
+            book: { type: object, nullable: true, properties: { id: { type: string }, title: { type: string }, isbn: { type: string } } }
+            assignee: { type: object, nullable: true, properties: { id: { type: string }, full_name: { type: string } } }
+    TicketDetail:
+      allOf:
+        - $ref: "#/components/schemas/TicketListItem"
+        - type: object
+          properties:
+            messages: { type: array, items: { $ref: "#/components/schemas/Message" } }
+            book_detail: { allOf: [{ $ref: "#/components/schemas/Book" }], nullable: true }
+            notes: { type: array, description: Admin only, items: { type: object } }
+            events: { type: array, description: Admin only, items: { type: object } }
+    Message:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ticket_id: { type: string, format: uuid }
+        sender_role: { type: string, enum: [author, admin] }
+        body: { type: string }
+        ai_assisted: { type: boolean }
+        created_at: { type: string, format: date-time }
+        sender: { type: object, nullable: true, properties: { full_name: { type: string } } }
+    Draft:
+      type: object
+      properties:
+        content: { type: string }
+        source: { type: string, enum: [ai, template] }
+        model: { type: string, nullable: true }
+        notice: { type: string, nullable: true, description: Shown when the AI was unavailable }
+        cached: { type: boolean }
+        created_at: { type: string, format: date-time }
